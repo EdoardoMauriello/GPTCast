@@ -242,12 +242,13 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, *, in_ch, out_ch, z_ch, hid_ch, hid_ch_mult=(1,2,4,8),
                  num_res_blocks=2, attn_level=(3), dropout=0.0, resamp_with_conv=True,
-                 **ignore_kwargs):
+                 use_level_skips=False, **ignore_kwargs):
         super().__init__()
         self.hid_ch = hid_ch
         self.num_resolutions = len(hid_ch_mult)
         self.num_res_blocks = num_res_blocks
         self.first_run = True
+        self.use_level_skips = use_level_skips
         attnblock = AttnBlock
         # self.resolution = resolution
         # self.in_channels = in_ch
@@ -280,10 +281,14 @@ class Decoder(nn.Module):
 
         # upsampling
         self.up = nn.ModuleList()
+        self.skip_convs = nn.ModuleList() # 1. Init module list
+        
         for i_level in reversed(range(self.num_resolutions)):
             block = nn.ModuleList()
             attn = nn.ModuleList()
             block_out = hid_ch*hid_ch_mult[i_level]
+            skip_in = block_in # 2. Capture input channels before loop updates block_in
+
             for i_block in range(self.num_res_blocks+1):
                 block.append(ResnetBlock(in_channels=block_in,
                                          out_channels=block_out,
@@ -299,6 +304,9 @@ class Decoder(nn.Module):
                 # curr_res = curr_res * 2
             self.up.insert(0, up) # prepend to get consistent order
 
+            # 3. Insert skip conv (using insert(0) to match reversed loop order)
+            if self.use_level_skips:
+                self.skip_convs.insert(0, torch.nn.Conv2d(skip_in, block_out, kernel_size=1))
         # end
         self.norm_out = Normalize(block_in)
         self.conv_out = torch.nn.Conv2d(block_in,
@@ -324,10 +332,18 @@ class Decoder(nn.Module):
 
         # upsampling
         for i_level in reversed(range(self.num_resolutions)):
+            if self.use_level_skips:
+                h_skip = h # 4. Capture state before blocks
+
             for i_block in range(self.num_res_blocks+1):
                 h = self.up[i_level].block[i_block](h)
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
+            
+            # 5. Apply skip connection
+            if self.use_level_skips:
+                h = h + self.skip_convs[i_level](h_skip)
+
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
